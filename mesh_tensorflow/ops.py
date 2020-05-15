@@ -5037,6 +5037,8 @@ def sample_with_temperature(x, dim, temperature=1.0, name=None):
   Returns:
     a Tensor with type tf.int32.
   """
+  # The numerics are unstable in bfloat16 - use float32.
+  x = cast(x, tf.float32)
   dim = convert_to_dimension(dim)
   with tf.name_scope(name, default_name="sample_with_temperature"):
     if temperature != 0.0:
@@ -5044,7 +5046,6 @@ def sample_with_temperature(x, dim, temperature=1.0, name=None):
       # Note: we don't want to generate 0 or 1 because:
       # * -log(-log(0)) is -infinity
       # * -log(-log(1)) is +infinity.
-      # np.finfo(x.dtype.as_numpy_dtype).tiny doesn't work on bfloat16
       tiny_val = 1e-9
       g = -log(-log(
           random_uniform(
