@@ -439,7 +439,7 @@ class Graph(object):
     return name
 
   def rewrite_stack_variables(self,
-                              max_combined_variable_size=2 ** 33,
+                              max_combined_variable_size=2 ** 30,
                               max_combined_slice_size=2 ** 27,
                               mesh_to_impl=None):
     """Rewrite the current graph to combine variables.
@@ -2603,6 +2603,7 @@ class SplitOperation(Operation):
             "splittable", [split_dim.name]))
 
   def gradient(self, grad_ys):
+    grad_ys = [g or zeros_like(o) for g, o in zip(grad_ys, self._outputs)]
     return [concat(grad_ys, self._split_dim.name)]
 
   def lower(self, lowering):
@@ -4906,7 +4907,12 @@ class TopKOperation(Operation):
     def _slicewise_top_k(t):
       t = tf.transpose(
           t, [i for i in range(ndims) if i != reduced_axis] + [reduced_axis])
-      return tf.math.top_k(t, min(self._k_dim.size, reduced_dim_per_shard))
+      if self._k_dim.size == 1:
+        # top_k seems to be slow on TPU - use reduce_max and argmax instead
+        return (tf.expand_dims(tf.math.reduce_max(t, -1), -1),
+                tf.expand_dims(tf.cast(tf.math.argmax(t, -1), tf.int32), -1))
+      else:
+        return tf.math.top_k(t, min(self._k_dim.size, reduced_dim_per_shard))
     values, indices = mesh_impl.slicewise(_slicewise_top_k, lowering.tensors[x])
     if reduced_mesh_axis is not None:
       # indices are now indices within a shard.  Make them global indices.
@@ -4944,7 +4950,7 @@ def top_k(x, reduced_dim, k_dim, name=None):
     values: a Tensor with same type as x.
     indices: a Tensor with dtype tf.int32
   """
-  if k_dim.size < 5:
+  if k_dim.size > 1 and k_dim.size < 5:
     return _iterative_top_k(x, reduced_dim, k_dim, name=name)
   else:
     op = TopKOperation(x, reduced_dim, k_dim, name=name)
@@ -4982,11 +4988,8 @@ def _iterative_top_k(x, reduced_dim, k_dim, name=None):
   return stack(values, k_dim.name, -1), stack(indices, k_dim.name, -1)
 
 
-def _top_1_using_top_k(x, reduced_dim, name=None):
+def top_1(x, reduced_dim, name=None):
   """Max and Argmax.
-
-  Implementation relies on tf.math.top_k, which seems to be slow on TPU,
-  since it sorts.
 
   Args:
     x: a Tensor
@@ -5001,26 +5004,6 @@ def _top_1_using_top_k(x, reduced_dim, name=None):
   values = reshape(values, values.shape - one_dim)
   indices = reshape(indices, indices.shape - one_dim)
   return values, indices
-
-
-def top_1(x, reduced_dim, name=None):
-  """Max and Argmax.
-
-  Args:
-    x: a Tensor
-    reduced_dim: a Dimension in x.shape.dims
-    name: an optional string
-  Returns:
-    values: Tensor equal to mtf.reduce_max(x, reduced_dim=reduced_dim)
-    indices: a Tensor with dtype tf.int32
-  """
-  reduced_dim = convert_to_dimension(reduced_dim)
-  with tf.name_scope(name, default_name="top_1"):
-    max_val = reduce_max(x, reduced_dim=reduced_dim)
-    is_max = to_float(equal(x, max_val))
-    pos = mtf_range(x.mesh, reduced_dim, tf.float32)
-    indices = cast(reduce_max(is_max * pos, reduced_dim=reduced_dim), tf.int32)
-    return max_val, indices
 
 
 def argmax(x, reduced_dim, name=None):
@@ -5049,8 +5032,6 @@ def sample_with_temperature(x, dim, temperature=1.0, name=None):
   Returns:
     a Tensor with type tf.int32.
   """
-  # The numerics are unstable in bfloat16 - use float32.
-  x = cast(x, tf.float32)
   dim = convert_to_dimension(dim)
   with tf.name_scope(name, default_name="sample_with_temperature"):
     if temperature != 0.0:
@@ -5058,6 +5039,8 @@ def sample_with_temperature(x, dim, temperature=1.0, name=None):
       # Note: we don't want to generate 0 or 1 because:
       # * -log(-log(0)) is -infinity
       # * -log(-log(1)) is +infinity.
+      # The numerics may be weird in bfloat16 - use float32.
+      x = cast(x, tf.float32)
       tiny_val = 1e-9
       g = -log(-log(
           random_uniform(
